@@ -1,0 +1,10 @@
+.work/
+.venv/
+__pycache__/
+*.pyc
+.DS_Store
+temp/
+titan-extract/
+*.img
+*.img.zst
+*.tar.gz

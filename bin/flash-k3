@@ -1,0 +1,236 @@
+#!/usr/bin/env bash
+# flash-k3 — macOS CLI flash helper for SpacemiT K3 / BPI-SM10 (CoM260)
+#
+# Titantools (GUI) ships Windows/Linux only and is closed source.
+# This wraps SpacemiT's open fastboot.yaml flow + Homebrew `fastboot`.
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+VENDOR="$ROOT/vendor/spacemit-k3-ubuntu-images"
+WORKDIR="${FLASH_WORKDIR:-$ROOT/.work}"
+
+if [[ -x "$ROOT/.venv/bin/python" ]]; then
+  PYTHON="$ROOT/.venv/bin/python"
+else
+  PYTHON="${PYTHON:-python3}"
+fi
+
+die() { echo "error: $*" >&2; exit 1; }
+need() { command -v "$1" >/dev/null || die "missing dependency: $1"; }
+
+usage() {
+  cat <<'EOF'
+Usage:
+  flash-k3 check
+  flash-k3 devices
+  flash-k3 flash --image PATH.img[.zst]
+  flash-k3 flash --titan PATH.tar.gz|/path/to/extracted-titan-dir
+  flash-k3 extract --image PATH.img[.zst]
+
+Board setup (BPI-SM10 / CoM260):
+  1. DC jack power (not USB-C power)
+  2. Hold FC_REC, power on (or RST), release FC_REC
+  3. Connect USB-C to this Mac (UFP / download mode)
+  4. Run: flash-k3 devices   # should list a fastboot device
+  5. Run: flash-k3 flash --image ...   or   --titan ...
+
+Dependencies (Homebrew):
+  brew install android-platform-tools zstd python
+  python3 -m venv .venv && .venv/bin/pip install pyyaml
+EOF
+}
+
+check_deps() {
+  need fastboot
+  need zstd
+  [[ -x "$PYTHON" ]] || need python3
+  "$PYTHON" -c 'import yaml' 2>/dev/null || die "PyYAML missing — run: python3 -m venv .venv && .venv/bin/pip install pyyaml"
+  echo "fastboot: $(command -v fastboot) ($(fastboot --version 2>&1 | head -1))"
+  echo "python:   $PYTHON ($("$PYTHON" --version 2>&1))"
+  echo "zstd:     $(command -v zstd)"
+  echo "vendor:   $VENDOR"
+}
+
+cmd_devices() {
+  check_deps >/dev/null
+  echo "Waiting for fastboot device (Ctrl-C to abort)..."
+  fastboot devices -l || true
+  if ! fastboot devices | grep -q .; then
+    echo
+    echo "No device yet. Enter download mode (FC_REC + power), USB-C to Mac, then re-run."
+    exit 1
+  fi
+}
+
+prepare_vendor_workdir() {
+  mkdir -p "$WORKDIR"
+  cp -f "$VENDOR/fastboot.yaml" "$WORKDIR/"
+  cp -f "$VENDOR"/partition_*.json "$WORKDIR/"
+  # Mac-friendly flash driver (resolves factory/ paths for stage)
+  cp -f "$ROOT/src/image_flash_macos.py" "$WORKDIR/image_flash.py"
+}
+
+cmd_extract() {
+  local img=""
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --image) img="$2"; shift 2 ;;
+      *) die "unknown arg: $1" ;;
+    esac
+  done
+  [[ -n "$img" && -f "$img" ]] || die "--image PATH required"
+  prepare_vendor_workdir
+  (
+    cd "$WORKDIR"
+    rm -rf temp
+    "$PYTHON" image_flash.py --img "$img" --partition partition_universal.json
+  )
+  echo "Extracted partitions in $WORKDIR/temp"
+}
+
+stage_firmware_into_temp() {
+  # BootROM staging needs FSBL.bin + u-boot.itb beside extracted partitions.
+  local fw="${FIRMWARE_DIR:-}"
+  mkdir -p "$WORKDIR/temp"
+  if [[ -n "$fw" ]]; then
+    [[ -d "$fw" ]] || die "FIRMWARE_DIR not a directory: $fw"
+    for f in u-boot.itb FSBL.bin factory/FSBL.bin factory/bootinfo_block.bin \
+             factory/bootinfo_spinand.bin factory/bootinfo_spinor.bin ec.bin; do
+      if [[ -f "$fw/$f" ]]; then
+        local base
+        base="$(basename "$f")"
+        cp -f "$fw/$f" "$WORKDIR/temp/$base"
+        mkdir -p "$WORKDIR/temp/factory"
+        if [[ "$f" == factory/* ]]; then
+          cp -f "$fw/$f" "$WORKDIR/temp/$f"
+        fi
+      fi
+    done
+  fi
+  # Also accept files already placed next to the image by the user
+  for f in u-boot.itb FSBL.bin ec.bin; do
+    if [[ -f "$WORKDIR/$f" && ! -f "$WORKDIR/temp/$f" ]]; then
+      cp -f "$WORKDIR/$f" "$WORKDIR/temp/$f"
+    fi
+  done
+  [[ -f "$WORKDIR/temp/u-boot.itb" ]] || die "missing u-boot.itb (set FIRMWARE_DIR=/path/to/titan-or-uboot-dir, or place it in $WORKDIR/)"
+  [[ -f "$WORKDIR/temp/FSBL.bin" || -f "$WORKDIR/temp/factory/FSBL.bin" ]] \
+    || echo "warning: FSBL.bin not found — BootROM stage may be skipped if device already past BROM" >&2
+}
+
+cmd_flash_image() {
+  local img=""
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --image) img="$2"; shift 2 ;;
+      *) die "unknown arg: $1" ;;
+    esac
+  done
+  [[ -n "$img" && -f "$img" ]] || die "--image PATH required"
+  check_deps
+  prepare_vendor_workdir
+  (
+    cd "$WORKDIR"
+    rm -rf temp
+    "$PYTHON" image_flash.py --img "$img" --partition partition_universal.json
+  )
+  stage_firmware_into_temp
+  echo
+  echo "Flashing via fastboot (device must be in download mode)..."
+  (
+    cd "$WORKDIR"
+    "$PYTHON" image_flash.py --fastboot fastboot.yaml
+  )
+}
+
+cmd_flash_titan() {
+  local src=""
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --titan) src="$2"; shift 2 ;;
+      *) die "unknown arg: $1" ;;
+    esac
+  done
+  [[ -n "$src" ]] || die "--titan PATH required"
+  check_deps
+  prepare_vendor_workdir
+
+  local titan_dir
+  if [[ -d "$src" ]]; then
+    titan_dir="$(cd "$src" && pwd)"
+  elif [[ -f "$src" && "$src" == *.tar.gz ]]; then
+    titan_dir="$WORKDIR/titan-extract"
+    rm -rf "$titan_dir"
+    mkdir -p "$titan_dir"
+    tar -xzf "$src" -C "$titan_dir"
+    # Some archives nest one directory
+    if [[ ! -f "$titan_dir/fastboot.yaml" ]]; then
+      local nested
+      nested="$(find "$titan_dir" -maxdepth 2 -name fastboot.yaml | head -1 || true)"
+      [[ -n "$nested" ]] || die "no fastboot.yaml inside $src"
+      titan_dir="$(dirname "$nested")"
+    fi
+  else
+    die "--titan must be a .tar.gz or extracted Titantools directory"
+  fi
+
+  # Prefer packaged yaml/partitions; fall back to vendored copies
+  [[ -f "$titan_dir/fastboot.yaml" ]] || cp -f "$WORKDIR/fastboot.yaml" "$titan_dir/"
+  for p in "$WORKDIR"/partition_*.json; do
+    local base; base="$(basename "$p")"
+    [[ -f "$titan_dir/$base" ]] || cp -f "$p" "$titan_dir/"
+  done
+
+  # image_flash expects staged payloads under ./temp with basenames
+  mkdir -p "$titan_dir/temp"
+  for f in u-boot.itb ec.bin FSBL.bin; do
+    if [[ -f "$titan_dir/$f" ]]; then
+      cp -f "$titan_dir/$f" "$titan_dir/temp/$f"
+    fi
+  done
+  if [[ -f "$titan_dir/factory/FSBL.bin" ]]; then
+    cp -f "$titan_dir/factory/FSBL.bin" "$titan_dir/temp/FSBL.bin"
+    mkdir -p "$titan_dir/temp/factory"
+    cp -f "$titan_dir/factory/"* "$titan_dir/temp/factory/" 2>/dev/null || true
+  fi
+  # Partition images live at titan root; point TEMP_DIR at titan root via symlink layout
+  # Copy non-dir files that look like partition payloads into temp for multi_flash
+  shopt -s nullglob
+  for f in "$titan_dir"/*; do
+    [[ -f "$f" ]] || continue
+    case "$(basename "$f")" in
+      fastboot.yaml|*.json|md5sums.txt) continue ;;
+    esac
+    cp -f "$f" "$titan_dir/temp/$(basename "$f")"
+  done
+  shopt -u nullglob
+
+  cp -f "$ROOT/src/image_flash_macos.py" "$titan_dir/image_flash.py"
+  echo "Flashing Titantools package from $titan_dir ..."
+  (
+    cd "$titan_dir"
+    "$PYTHON" image_flash.py --fastboot fastboot.yaml
+  )
+}
+
+main() {
+  [[ $# -ge 1 ]] || { usage; exit 1; }
+  local cmd="$1"; shift
+  case "$cmd" in
+    -h|--help|help) usage ;;
+    check) check_deps ;;
+    devices) cmd_devices ;;
+    extract) cmd_extract "$@" ;;
+    flash)
+      [[ $# -ge 1 ]] || die "flash requires --image or --titan"
+      case "$1" in
+        --image) cmd_flash_image "$@" ;;
+        --titan) cmd_flash_titan "$@" ;;
+        *) die "flash requires --image or --titan" ;;
+      esac
+      ;;
+    *) die "unknown command: $cmd (try --help)" ;;
+  esac
+}
+
+main "$@"
